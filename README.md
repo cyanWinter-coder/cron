@@ -18,6 +18,40 @@ It requires Go 1.11 or later due to usage of Go Modules.
 Refer to the documentation here:
 http://godoc.org/github.com/robfig/cron
 
+## Missed-execution recovery (catch-up)
+
+By default, activations missed while the scheduler is down are skipped: only
+future activations run. An opt-in, auditable catch-up mechanism can recover
+them at startup instead:
+
+```go
+store, _ := cron.NewFileCursorStore("/var/lib/myapp/cron-cursors.json")
+c := cron.New(
+  cron.WithCatchupPolicy(cron.CatchupAll), // or CatchupLast / CatchupSkip
+  cron.WithCursorStore(store),
+  cron.WithMaxCatchup(100),                // bound the backlog size
+  cron.WithMaxLateness(time.Hour),         // bound how old misses may be
+  cron.WithCatchupReporter(func(r cron.CatchupReport) {
+    log.Printf("entry %d: claimed=%d dropped=%v", r.EntryID, len(r.Claimed), r.Dropped)
+  }),
+)
+// Give entries a stable key so their cursor survives restarts:
+c.AddFuncWithKey("nightly-report", "0 3 * * *", runReport)
+c.Start()
+```
+
+At startup, every activation time between the committed cursor and now is
+computed and, per policy, claimed and dispatched through the same Chain and
+job waiter as regular runs — each missed time runs exactly once. The cursor
+only advances for activations that were actually claimed, and cursor commits
+are monotonic compare-and-swap operations, so clock jumps and stale writes
+from an older process can neither duplicate activations nor roll the cursor
+back. Backlogs beyond `WithMaxCatchup`/`WithMaxLateness` are not run but
+reported, with reasons, in the structured `CatchupReport` (also available via
+`c.CatchupReports()`). `MemoryCursorStore` is provided for tests and
+single-process use; implement `CursorStore` on a compare-and-swap backend for
+multi-process deployments.
+
 The rest of this document describes the the advances in v3 and a list of
 breaking changes for users that wish to upgrade from an earlier version.
 

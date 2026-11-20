@@ -216,6 +216,28 @@ Activate it with a one-off logger as follows:
 		cron.WithLogger(
 			cron.VerbosePrintfLogger(log.New(os.Stdout, "cron: ", log.LstdFlags))))
 
+Missed-execution recovery
+
+By default, activations missed while the scheduler is down are skipped. A
+catch-up policy plus a cursor store recovers them at startup instead:
+
+	cron.New(
+		cron.WithCatchupPolicy(cron.CatchupAll),
+		cron.WithCursorStore(store),
+		cron.WithMaxCatchup(100),
+		cron.WithMaxLateness(time.Hour),
+		cron.WithCatchupReporter(func(r cron.CatchupReport) { ... }))
+
+At startup, every activation between the committed cursor and now is computed
+and, per policy, claimed and dispatched through the same chain and job waiter
+as regular runs, each exactly once. Cursor commits are monotonic
+compare-and-swap operations and only happen for activations that were
+actually claimed, so clock jumps and stale writes from an older process can
+neither duplicate activations nor roll the cursor back. Missed activations
+dropped by the backlog bounds are reported, with reasons, in the structured
+CatchupReport. Entries need a stable key (see ScheduleWithKey) for their
+cursor to be found across restarts.
+
 
 Implementation
 

@@ -24,6 +24,14 @@ type Cron struct {
 	parser    ScheduleParser
 	nextID    EntryID
 	jobWaiter sync.WaitGroup
+
+	catchupPolicy   CatchupPolicy
+	cursorStore     CursorStore
+	maxCatchup      int
+	maxLateness     time.Duration
+	catchupReporter func(CatchupReport)
+	catchupMu       sync.Mutex
+	catchupReports  []CatchupReport
 }
 
 // ScheduleParser is an interface for schedule spec parsers that return a Schedule
@@ -69,6 +77,12 @@ type Entry struct {
 	// It is kept around so that user code that needs to get at the job later,
 	// e.g. via Entries() can do so.
 	Job Job
+
+	// Key is a stable identity for this entry, used as the cursor-store key
+	// for catch-up recovery. It is empty unless the entry was added with one
+	// of the *WithKey methods; in that case a per-process key derived from
+	// the entry ID is used instead.
+	Key string
 }
 
 // Valid returns true if this is not the zero entry.
@@ -153,9 +167,37 @@ func (c *Cron) AddJob(spec string, cmd Job) (EntryID, error) {
 	return c.Schedule(schedule, cmd), nil
 }
 
+// AddFuncWithKey is like AddFunc, but assigns the entry a stable key used to
+// track its catch-up cursor across restarts. See ScheduleWithKey.
+func (c *Cron) AddFuncWithKey(key, spec string, cmd func()) (EntryID, error) {
+	return c.AddJobWithKey(key, spec, FuncJob(cmd))
+}
+
+// AddJobWithKey is like AddJob, but assigns the entry a stable key used to
+// track its catch-up cursor across restarts. See ScheduleWithKey.
+func (c *Cron) AddJobWithKey(key, spec string, cmd Job) (EntryID, error) {
+	schedule, err := c.parser.Parse(spec)
+	if err != nil {
+		return 0, err
+	}
+	return c.ScheduleWithKey(key, schedule, cmd), nil
+}
+
 // Schedule adds a Job to the Cron to be run on the given schedule.
 // The job is wrapped with the configured Chain.
 func (c *Cron) Schedule(schedule Schedule, cmd Job) EntryID {
+	return c.schedule("", schedule, cmd)
+}
+
+// ScheduleWithKey is like Schedule, but assigns the entry a stable key. The
+// key identifies the entry's catch-up cursor in the CursorStore, so it must
+// be unique per entry and stable across process restarts for downtime
+// recovery to find the cursor committed by a previous run.
+func (c *Cron) ScheduleWithKey(key string, schedule Schedule, cmd Job) EntryID {
+	return c.schedule(key, schedule, cmd)
+}
+
+func (c *Cron) schedule(key string, schedule Schedule, cmd Job) EntryID {
 	c.runningMu.Lock()
 	defer c.runningMu.Unlock()
 	c.nextID++
@@ -164,6 +206,7 @@ func (c *Cron) Schedule(schedule Schedule, cmd Job) EntryID {
 		Schedule:   schedule,
 		WrappedJob: c.chain.Then(cmd),
 		Job:        cmd,
+		Key:        key,
 	}
 	if !c.running {
 		c.entries = append(c.entries, entry)
@@ -241,6 +284,18 @@ func (c *Cron) run() {
 
 	// Figure out the next activation times for each entry.
 	now := c.now()
+
+	// Recover activations missed while the scheduler was down, before any
+	// regular scheduling. If a stop was requested during recovery, exit.
+	if c.catchupPolicy != CatchupSkip {
+		if c.cursorStore == nil {
+			c.logger.Info("catchup: policy configured without a cursor store; missed activations will not be recovered")
+		} else if c.runCatchup(now) {
+			c.logger.Info("stop")
+			return
+		}
+	}
+
 	for _, entry := range c.entries {
 		entry.Next = entry.Schedule.Next(now)
 		c.logger.Info("schedule", "now", now, "entry", entry.ID, "next", entry.Next)
@@ -273,6 +328,10 @@ func (c *Cron) run() {
 					c.startJob(e.WrappedJob)
 					e.Prev = e.Next
 					e.Next = e.Schedule.Next(now)
+					// The job has been handed off; advance the catch-up
+					// cursor so this activation is not replayed after a
+					// restart.
+					c.commitCursor(e, e.Prev)
 					c.logger.Info("run", "now", now, "entry", e.ID, "next", e.Next)
 				}
 
